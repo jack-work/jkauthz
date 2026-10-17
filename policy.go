@@ -26,13 +26,48 @@ type Schema[R any] struct {
 
 type Decision struct {
 	Allowed  bool
-	Reason   string
 	Role     string
 	Selector string
+
+	cause   cause
+	subject Principal
+	verb    string
+	group   string
+	held    []string
 }
 
-func deny(format string, args ...any) Decision {
-	return Decision{Reason: fmt.Sprintf(format, args...)}
+type cause uint8
+
+const (
+	causeAllowed cause = iota
+	causeNoPolicy
+	causeUnknownVerb
+	causeNoPrincipal
+	causeNoRole
+	causeNoGrant
+)
+
+func (d Decision) Reason() string {
+	switch d.cause {
+	case causeAllowed:
+		via := "principal"
+		if d.group != "" {
+			via = "group " + d.group
+		}
+		return fmt.Sprintf("%s holds %s via %s: %s on %s", d.subject, d.Role, via, d.verb, d.Selector)
+	case causeNoPolicy:
+		return "no policy loaded"
+	case causeUnknownVerb:
+		return fmt.Sprintf("unknown verb %q", d.verb)
+	case causeNoPrincipal:
+		return "no principal"
+	case causeNoRole:
+		return fmt.Sprintf("%s holds no role", d.subject)
+	default:
+		held := slices.Clone(d.held)
+		sort.Strings(held)
+		return fmt.Sprintf("%s holds %s; none grants %s here", d.subject, strings.Join(slices.Compact(held), ", "), d.verb)
+	}
 }
 
 type Policy[R any] struct {
@@ -179,15 +214,15 @@ func compileBinding(b bindDoc, roles map[string][]grant) (binding, error) {
 	return out, nil
 }
 
-func (b binding) holder(s Subject) (string, bool) {
+func (b binding) holder(s Subject) (group string, ok bool) {
 	for _, p := range b.principals {
 		if p.matches(s.Principal) {
-			return "principal", true
+			return "", true
 		}
 	}
 	for _, g := range b.groups {
 		if s.InGroup(g) {
-			return "group " + g, true
+			return g, true
 		}
 	}
 	return "", false
@@ -195,18 +230,17 @@ func (b binding) holder(s Subject) (string, bool) {
 
 func (p *Policy[R]) Allow(s Subject, verb string, r R) Decision {
 	if !slices.Contains(p.schema.Verbs, verb) {
-		return deny("unknown verb %q", verb)
+		return Decision{cause: causeUnknownVerb, verb: verb}
 	}
 	if s.Principal.IsZero() {
-		return deny("no principal")
+		return Decision{cause: causeNoPrincipal}
 	}
 	var held []string
 	for _, b := range p.bindings {
-		via, ok := b.holder(s)
+		group, ok := b.holder(s)
 		if !ok {
 			continue
 		}
-		held = append(held, b.role)
 		for _, g := range p.roles[b.role] {
 			if !slices.Contains(g.verbs, verb) {
 				continue
@@ -215,20 +249,22 @@ func (p *Policy[R]) Allow(s Subject, verb string, r R) Decision {
 				if sel == Any || p.schema.Selectors.Match(sel, s, r) {
 					return Decision{
 						Allowed:  true,
-						Reason:   fmt.Sprintf("%s holds %s via %s: %s on %s", s.Principal, b.role, via, verb, sel),
 						Role:     b.role,
 						Selector: sel,
+						cause:    causeAllowed,
+						subject:  s.Principal,
+						verb:     verb,
+						group:    group,
 					}
 				}
 			}
 		}
+		held = append(held, b.role)
 	}
 	if len(held) == 0 {
-		return deny("%s holds no role", s.Principal)
+		return Decision{cause: causeNoRole, subject: s.Principal, verb: verb}
 	}
-	sort.Strings(held)
-	held = slices.Compact(held)
-	return deny("%s holds %s; none grants %s here", s.Principal, strings.Join(held, ", "), verb)
+	return Decision{cause: causeNoGrant, subject: s.Principal, verb: verb, held: held}
 }
 
 type Store[R any] struct {
@@ -264,7 +300,7 @@ func (s *Store[R]) Policy() *Policy[R] { return s.cur.Load() }
 func (s *Store[R]) Allow(sub Subject, verb string, r R) Decision {
 	p := s.cur.Load()
 	if p == nil {
-		return deny("no policy loaded")
+		return Decision{cause: causeNoPolicy, verb: verb}
 	}
 	return p.Allow(sub, verb, r)
 }

@@ -103,7 +103,7 @@ func TestAGroupBindingAdmitsAnyMemberWhateverTheirPrincipal(t *testing.T) {
 	p := compile(t, estate)
 	s := jkauthz.Subject{Principal: principal(t, "user:gluck"), Groups: []string{"figaro-admin"}}
 	d := p.Allow(s, "admin", aria{})
-	if !d.Allowed || !strings.Contains(d.Reason, "group figaro-admin") {
+	if !d.Allowed || !strings.Contains(d.Reason(), "group figaro-admin") {
 		t.Fatalf("group member is owner: %+v", d)
 	}
 }
@@ -131,15 +131,15 @@ func TestAVerbOutsideEveryHeldRoleIsDeniedWithTheRolesNamed(t *testing.T) {
 	if d.Allowed {
 		t.Fatal("sender cannot kill")
 	}
-	if !strings.Contains(d.Reason, "sender") || !strings.Contains(d.Reason, "kill") {
-		t.Fatalf("reason names the held roles and the verb: %q", d.Reason)
+	if !strings.Contains(d.Reason(), "sender") || !strings.Contains(d.Reason(), "kill") {
+		t.Fatalf("reason names the held roles and the verb: %q", d.Reason())
 	}
 }
 
 func TestAnUnboundPrincipalIsDenied(t *testing.T) {
 	p := compile(t, estate)
 	d := p.Allow(jkauthz.Subject{Principal: principal(t, "user:1001")}, "read", aria{})
-	if d.Allowed || !strings.Contains(d.Reason, "holds no role") {
+	if d.Allowed || !strings.Contains(d.Reason(), "holds no role") {
 		t.Fatalf("%+v", d)
 	}
 }
@@ -154,7 +154,7 @@ func TestTheZeroSubjectIsDeniedEvenWhereAGrantSaysAnything(t *testing.T) {
 func TestAVerbTheSchemaDoesNotKnowIsDeniedNotPanicked(t *testing.T) {
 	p := compile(t, estate)
 	d := p.Allow(jkauthz.Subject{Principal: principal(t, "user:1000")}, "teleport", aria{})
-	if d.Allowed || !strings.Contains(d.Reason, "unknown verb") {
+	if d.Allowed || !strings.Contains(d.Reason(), "unknown verb") {
 		t.Fatalf("%+v", d)
 	}
 }
@@ -261,7 +261,7 @@ grants = [{ verbs = ["use"], on = ["thing:1"] }]`), schema); err == nil {
 func TestAStoreWithNothingLoadedDenies(t *testing.T) {
 	s := jkauthz.NewStore(figaroSchema)
 	d := s.Allow(jkauthz.Subject{Principal: principal(t, "user:1000")}, "read", aria{})
-	if d.Allowed || d.Reason != "no policy loaded" {
+	if d.Allowed || d.Reason() != "no policy loaded" {
 		t.Fatalf("%+v", d)
 	}
 }
