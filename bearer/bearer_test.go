@@ -32,7 +32,7 @@ func (c *clock) Now() time.Time      { c.mu.Lock(); defer c.mu.Unlock(); return 
 func (c *clock) Add(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.mu.Unlock() }
 
 type issuerFixture struct {
-	t     *testing.T
+	t     testing.TB
 	clock *clock
 	mu    sync.Mutex
 	keys  map[string]*rsa.PrivateKey
@@ -40,7 +40,7 @@ type issuerFixture struct {
 	srv   *httptest.Server
 }
 
-func newIssuer(t *testing.T) *issuerFixture {
+func newIssuer(t testing.TB) *issuerFixture {
 	f := &issuerFixture{t: t, clock: &clock{t: time.Date(2026, 10, 17, 18, 0, 0, 0, time.UTC)}, keys: map[string]*rsa.PrivateKey{}}
 	f.rotate("k1")
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -241,7 +241,7 @@ type userinfoFixture struct {
 	srv    *httptest.Server
 }
 
-func newUserinfo(t *testing.T, body map[string]any) *userinfoFixture {
+func newUserinfo(t testing.TB, body map[string]any) *userinfoFixture {
 	u := &userinfoFixture{body: body, ctype: "application/json; charset=utf-8"}
 	u.status.Store(200)
 	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
