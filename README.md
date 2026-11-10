@@ -19,10 +19,13 @@ a display name). `Policy.Allow` never sees them.
 
 ```toml
 [roles.owner]
-grants = [{ verbs = ["*"], on = ["*"] }]
+grants = ["*:*"]
 
 [roles.sender]
-grants = [{ verbs = ["read", "listen", "send"], on = ["owner:self", "role:@herald"] }]
+grants = [
+  "read:owner:self", "listen:owner:self", "send:owner:self",
+  "read:role:@herald", "listen:role:@herald", "send:role:@herald",
+]
 
 [[bind]]
 role = "owner"
@@ -33,6 +36,13 @@ groups = ["figaro-admin"]
 role = "sender"
 principals = ["sandbox:*"]
 ```
+
+A grant is `verb:object`. The verb ends at the first colon, so the object
+keeps its own colons; either side may be `*`. A role's grants are held in
+canonical form: duplicates and grants another one covers are dropped (`*:X`
+covers `read:X`, `read:*` covers `read:X`), then sorted by the schema's verb
+order and by object. `Grants.String` prints that form and `ParseGrants`
+reads it back. Covering is syntactic: no selector is taken to contain another.
 
 The host service supplies a `Schema`: its verbs, and a `Selectors`
 implementation that validates and matches every selector except `*` against

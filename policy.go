@@ -3,6 +3,7 @@ package jkauthz
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"sort"
@@ -72,13 +73,13 @@ func (d Decision) Reason() string {
 
 type Policy[R any] struct {
 	schema   Schema[R]
-	roles    map[string][]grant
+	roles    map[string]role
 	bindings []binding
 }
 
-type grant struct {
-	verbs []string
-	on    []string
+type role struct {
+	grants Grants
+	byVerb [][]string
 }
 
 type binding struct {
@@ -103,12 +104,7 @@ type document struct {
 }
 
 type roleDoc struct {
-	Grants []grantDoc `toml:"grants"`
-}
-
-type grantDoc struct {
-	Verbs []string `toml:"verbs"`
-	On    []string `toml:"on"`
+	Grants []string `toml:"grants"`
 }
 
 type bindDoc struct {
@@ -124,6 +120,9 @@ func Compile[R any](data []byte, schema Schema[R]) (*Policy[R], error) {
 	var doc document
 	md, err := toml.NewDecoder(bytes.NewReader(data)).Decode(&doc)
 	if err != nil {
+		if why := retiredTables(data); why != nil {
+			return nil, why
+		}
 		return nil, err
 	}
 	if extra := md.Undecoded(); len(extra) > 0 {
@@ -133,16 +132,16 @@ func Compile[R any](data []byte, schema Schema[R]) (*Policy[R], error) {
 		}
 		return nil, fmt.Errorf("unknown keys: %s", strings.Join(keys, ", "))
 	}
-	p := &Policy[R]{schema: schema, roles: map[string][]grant{}}
+	p := &Policy[R]{schema: schema, roles: map[string]role{}}
 	for name, r := range doc.Roles {
 		if err := validName("role", name); err != nil {
 			return nil, err
 		}
-		grants, err := compileGrants(name, r.Grants, schema)
+		compiled, err := compileRole(name, r.Grants, schema)
 		if err != nil {
 			return nil, err
 		}
-		p.roles[name] = grants
+		p.roles[name] = compiled
 	}
 	for i, b := range doc.Bind {
 		bd, err := compileBinding(b, p.roles)
@@ -154,43 +153,26 @@ func Compile[R any](data []byte, schema Schema[R]) (*Policy[R], error) {
 	return p, nil
 }
 
-func compileGrants[R any](role string, docs []grantDoc, schema Schema[R]) ([]grant, error) {
-	if len(docs) == 0 {
-		return nil, fmt.Errorf("role %s grants nothing", role)
+func compileRole[R any](name string, texts []string, schema Schema[R]) (role, error) {
+	if len(texts) == 0 {
+		return role{}, fmt.Errorf("role %s grants nothing", name)
 	}
-	out := make([]grant, 0, len(docs))
-	for i, g := range docs {
-		if len(g.Verbs) == 0 || len(g.On) == 0 {
-			return nil, fmt.Errorf("role %s grant %d: needs verbs and on", role, i)
-		}
-		var verbs []string
-		for _, v := range g.Verbs {
-			switch {
-			case v == Any:
-				verbs = append(verbs, schema.Verbs...)
-			case slices.Contains(schema.Verbs, v):
-				verbs = append(verbs, v)
-			default:
-				return nil, fmt.Errorf("role %s grant %d: unknown verb %q", role, i, v)
-			}
-		}
-		for _, sel := range g.On {
-			if sel == Any {
-				continue
-			}
-			if schema.Selectors == nil {
-				return nil, fmt.Errorf("role %s grant %d: selector %q but the schema matches only %q", role, i, sel, Any)
-			}
-			if err := schema.Selectors.Validate(sel); err != nil {
-				return nil, fmt.Errorf("role %s grant %d: selector %q: %w", role, i, sel, err)
-			}
-		}
-		out = append(out, grant{verbs: verbs, on: slices.Clone(g.On)})
+	grants, err := schema.ParseGrants(texts)
+	if err != nil {
+		return role{}, fmt.Errorf("role %s: %w", name, err)
 	}
-	return out, nil
+	r := role{grants: grants, byVerb: make([][]string, len(schema.Verbs))}
+	for _, g := range grants {
+		for i, v := range schema.Verbs {
+			if (g.Verb == Any || g.Verb == v) && !slices.Contains(r.byVerb[i], g.Object) {
+				r.byVerb[i] = append(r.byVerb[i], g.Object)
+			}
+		}
+	}
+	return r, nil
 }
 
-func compileBinding(b bindDoc, roles map[string][]grant) (binding, error) {
+func compileBinding(b bindDoc, roles map[string]role) (binding, error) {
 	if _, ok := roles[b.Role]; !ok {
 		return binding{}, fmt.Errorf("unknown role %q", b.Role)
 	}
@@ -229,7 +211,8 @@ func (b binding) holder(s Subject) (group string, ok bool) {
 }
 
 func (p *Policy[R]) Allow(s Subject, verb string, r R) Decision {
-	if !slices.Contains(p.schema.Verbs, verb) {
+	vi := slices.Index(p.schema.Verbs, verb)
+	if vi < 0 {
 		return Decision{cause: causeUnknownVerb, verb: verb}
 	}
 	if s.Principal.IsZero() {
@@ -241,21 +224,16 @@ func (p *Policy[R]) Allow(s Subject, verb string, r R) Decision {
 		if !ok {
 			continue
 		}
-		for _, g := range p.roles[b.role] {
-			if !slices.Contains(g.verbs, verb) {
-				continue
-			}
-			for _, sel := range g.on {
-				if sel == Any || p.schema.Selectors.Match(sel, s, r) {
-					return Decision{
-						Allowed:  true,
-						Role:     b.role,
-						Selector: sel,
-						cause:    causeAllowed,
-						subject:  s.Principal,
-						verb:     verb,
-						group:    group,
-					}
+		for _, sel := range p.roles[b.role].byVerb[vi] {
+			if sel == Any || p.schema.Selectors.Match(sel, s, r) {
+				return Decision{
+					Allowed:  true,
+					Role:     b.role,
+					Selector: sel,
+					cause:    causeAllowed,
+					subject:  s.Principal,
+					verb:     verb,
+					group:    group,
 				}
 			}
 		}
@@ -303,4 +281,55 @@ func (s *Store[R]) Allow(sub Subject, verb string, r R) Decision {
 		return Decision{cause: causeNoPolicy, verb: verb}
 	}
 	return p.Allow(sub, verb, r)
+}
+
+func (p *Policy[R]) Binds(s Subject) bool {
+	if s.Principal.IsZero() {
+		return false
+	}
+	return slices.ContainsFunc(p.bindings, func(b binding) bool {
+		_, ok := b.holder(s)
+		return ok
+	})
+}
+
+func (p *Policy[R]) Roles() map[string]Grants {
+	out := make(map[string]Grants, len(p.roles))
+	for name, r := range p.roles {
+		out[name] = slices.Clone(r.grants)
+	}
+	return out
+}
+
+func retiredTables(data []byte) error {
+	var doc struct {
+		Roles map[string]struct {
+			Grants []struct {
+				Verbs []string `toml:"verbs"`
+				On    []string `toml:"on"`
+			} `toml:"grants"`
+		} `toml:"roles"`
+	}
+	if _, err := toml.Decode(string(data), &doc); err != nil {
+		return nil
+	}
+	names := slices.Sorted(maps.Keys(doc.Roles))
+	var lines []string
+	for _, name := range names {
+		var grants []string
+		for _, g := range doc.Roles[name].Grants {
+			for _, v := range g.Verbs {
+				for _, on := range g.On {
+					grants = append(grants, fmt.Sprintf("%q", v+":"+on))
+				}
+			}
+		}
+		if len(grants) > 0 {
+			lines = append(lines, fmt.Sprintf("[roles.%s] grants = [%s]", name, strings.Join(grants, ", ")))
+		}
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return fmt.Errorf("grants are verb:object strings now, not { verbs, on } tables; write\n%s", strings.Join(lines, "\n"))
 }

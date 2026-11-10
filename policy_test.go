@@ -54,12 +54,13 @@ var figaroSchema = jkauthz.Schema[aria]{
 
 const estate = `
 [roles.owner]
-grants = [{ verbs = ["*"], on = ["*"] }]
+grants = ["*:*"]
 
 [roles.sender]
 grants = [
-  { verbs = ["read", "listen", "send"], on = ["owner:self", "role:@herald"] },
-  { verbs = ["create"], on = ["*"] },
+  "read:owner:self", "listen:owner:self", "send:owner:self",
+  "read:role:@herald", "listen:role:@herald", "send:role:@herald",
+  "create:*",
 ]
 
 [[bind]]
@@ -167,7 +168,7 @@ func TestAPrincipalOnAnotherNodeIsNotTheLocalPrincipalOfTheSameName(t *testing.T
 	}
 	q := compile(t, `
 [roles.peer]
-grants = [{ verbs = ["read"], on = ["*"] }]
+grants = ["read:*"]
 [[bind]]
 role = "peer"
 principals = ["spain2/user:1000"]
@@ -180,7 +181,7 @@ principals = ["spain2/user:1000"]
 func TestAKindWildcardAdmitsEveryIDOfThatKindAndNothingElse(t *testing.T) {
 	p := compile(t, `
 [roles.reader]
-grants = [{ verbs = ["read"], on = ["*"] }]
+grants = ["read:*"]
 [[bind]]
 role = "reader"
 principals = ["sandbox:*"]
@@ -204,19 +205,19 @@ func TestCompileRefusesWhatWouldOtherwiseFailSilently(t *testing.T) {
 	cases := map[string]string{
 		"unknown verb": `
 [roles.r]
-grants = [{ verbs = ["sned"], on = ["*"] }]`,
+grants = ["sned:*"]`,
 		"unknown selector": `
 [roles.r]
-grants = [{ verbs = ["read"], on = ["owner:me"] }]`,
+grants = ["read:owner:me"]`,
 		"unknown role in binding": `
 [roles.r]
-grants = [{ verbs = ["read"], on = ["*"] }]
+grants = ["read:*"]
 [[bind]]
 role = "rr"
 principals = ["user:1"]`,
 		"binding to nobody": `
 [roles.r]
-grants = [{ verbs = ["read"], on = ["*"] }]
+grants = ["read:*"]
 [[bind]]
 role = "r"`,
 		"role that grants nothing": `
@@ -224,13 +225,16 @@ role = "r"`,
 grants = []`,
 		"grant without selectors": `
 [roles.r]
-grants = [{ verbs = ["read"] }]`,
+grants = ["read"]`,
+		"the retired table form": `
+[roles.r]
+grants = [{ verbs = ["read"], on = ["*"] }]`,
 		"misspelled key": `
 [roles.r]
-grant = [{ verbs = ["read"], on = ["*"] }]`,
+grant = ["read:*"]`,
 		"malformed principal": `
 [roles.r]
-grants = [{ verbs = ["read"], on = ["*"] }]
+grants = ["read:*"]
 [[bind]]
 role = "r"
 principals = ["1000"]`,
@@ -248,12 +252,12 @@ func TestASchemaWithoutSelectorsAcceptsOnlyTheWildcard(t *testing.T) {
 	schema := jkauthz.Schema[struct{}]{Verbs: []string{"use"}}
 	if _, err := jkauthz.Compile([]byte(`
 [roles.r]
-grants = [{ verbs = ["use"], on = ["*"] }]`), schema); err != nil {
+grants = ["use:*"]`), schema); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := jkauthz.Compile([]byte(`
 [roles.r]
-grants = [{ verbs = ["use"], on = ["thing:1"] }]`), schema); err == nil {
+grants = ["use:thing:1"]`), schema); err == nil {
 		t.Fatal("compiled a selector nothing can match")
 	}
 }
@@ -347,4 +351,15 @@ func TestReadersNeverSeeAHalfLoadedPolicy(t *testing.T) {
 		}
 	}
 	wg.Wait()
+}
+
+func TestTheRetiredTableFormIsRefusedWithItsStringSpelling(t *testing.T) {
+	_, err := jkauthz.Compile([]byte(`
+[roles.sender]
+grants = [{ verbs = ["read", "send"], on = ["owner:self", "role:@herald"] }]
+`), figaroSchema)
+	want := `[roles.sender] grants = ["read:owner:self", "read:role:@herald", "send:owner:self", "send:role:@herald"]`
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("want the string form in the error, got %v", err)
+	}
 }
