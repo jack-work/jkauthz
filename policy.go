@@ -75,6 +75,7 @@ type Policy[R any] struct {
 	schema   Schema[R]
 	roles    map[string]role
 	bindings []binding
+	retired  []string
 }
 
 type role struct {
@@ -104,7 +105,8 @@ type document struct {
 }
 
 type roleDoc struct {
-	Grants []string `toml:"grants"`
+	Permissions []string `toml:"permissions"`
+	Grants      []string `toml:"grants"`
 }
 
 type bindDoc struct {
@@ -137,7 +139,15 @@ func Compile[R any](data []byte, schema Schema[R]) (*Policy[R], error) {
 		if err := validName("role", name); err != nil {
 			return nil, err
 		}
-		compiled, err := compileRole(name, r.Grants, schema)
+		texts := r.Permissions
+		switch newName, oldName := md.IsDefined("roles", name, "permissions"), md.IsDefined("roles", name, "grants"); {
+		case newName && oldName:
+			return nil, fmt.Errorf("role %s sets both permissions and grants: grants is the old name for permissions; keep one", name)
+		case oldName:
+			texts = r.Grants
+			p.retired = append(p.retired, fmt.Sprintf("[roles.%s] grants", name))
+		}
+		compiled, err := compileRole(name, texts, schema)
 		if err != nil {
 			return nil, err
 		}
@@ -150,12 +160,15 @@ func Compile[R any](data []byte, schema Schema[R]) (*Policy[R], error) {
 		}
 		p.bindings = append(p.bindings, bd)
 	}
+	sort.Strings(p.retired)
 	return p, nil
 }
 
+func (p *Policy[R]) RetiredNames() []string { return slices.Clone(p.retired) }
+
 func compileRole[R any](name string, texts []string, schema Schema[R]) (role, error) {
 	if len(texts) == 0 {
-		return role{}, fmt.Errorf("role %s grants nothing", name)
+		return role{}, fmt.Errorf("role %s permits nothing", name)
 	}
 	grants, err := schema.ParseGrants(texts)
 	if err != nil {
@@ -301,13 +314,16 @@ func (p *Policy[R]) Roles() map[string]Grants {
 	return out
 }
 
+type retiredTable struct {
+	Verbs []string `toml:"verbs"`
+	On    []string `toml:"on"`
+}
+
 func retiredTables(data []byte) error {
 	var doc struct {
 		Roles map[string]struct {
-			Grants []struct {
-				Verbs []string `toml:"verbs"`
-				On    []string `toml:"on"`
-			} `toml:"grants"`
+			Permissions []retiredTable `toml:"permissions"`
+			Grants      []retiredTable `toml:"grants"`
 		} `toml:"roles"`
 	}
 	if _, err := toml.Decode(string(data), &doc); err != nil {
@@ -317,7 +333,7 @@ func retiredTables(data []byte) error {
 	var lines []string
 	for _, name := range names {
 		var grants []string
-		for _, g := range doc.Roles[name].Grants {
+		for _, g := range append(doc.Roles[name].Permissions, doc.Roles[name].Grants...) {
 			for _, v := range g.Verbs {
 				for _, on := range g.On {
 					grants = append(grants, fmt.Sprintf("%q", v+":"+on))
@@ -325,11 +341,11 @@ func retiredTables(data []byte) error {
 			}
 		}
 		if len(grants) > 0 {
-			lines = append(lines, fmt.Sprintf("[roles.%s] grants = [%s]", name, strings.Join(grants, ", ")))
+			lines = append(lines, fmt.Sprintf("[roles.%s] permissions = [%s]", name, strings.Join(grants, ", ")))
 		}
 	}
 	if len(lines) == 0 {
 		return nil
 	}
-	return fmt.Errorf("grants are verb:object strings now, not { verbs, on } tables; write\n%s", strings.Join(lines, "\n"))
+	return fmt.Errorf("permissions are verb:object strings now, not { verbs, on } tables; write\n%s", strings.Join(lines, "\n"))
 }

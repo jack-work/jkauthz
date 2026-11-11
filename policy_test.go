@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -54,10 +56,10 @@ var figaroSchema = jkauthz.Schema[aria]{
 
 const estate = `
 [roles.owner]
-grants = ["*:*"]
+permissions = ["*:*"]
 
 [roles.sender]
-grants = [
+permissions = [
   "read:owner:self", "listen:owner:self", "send:owner:self",
   "read:role:@herald", "listen:role:@herald", "send:role:@herald",
   "create:*",
@@ -168,7 +170,7 @@ func TestAPrincipalOnAnotherNodeIsNotTheLocalPrincipalOfTheSameName(t *testing.T
 	}
 	q := compile(t, `
 [roles.peer]
-grants = ["read:*"]
+permissions = ["read:*"]
 [[bind]]
 role = "peer"
 principals = ["spain2/user:1000"]
@@ -181,7 +183,7 @@ principals = ["spain2/user:1000"]
 func TestAKindWildcardAdmitsEveryIDOfThatKindAndNothingElse(t *testing.T) {
 	p := compile(t, `
 [roles.reader]
-grants = ["read:*"]
+permissions = ["read:*"]
 [[bind]]
 role = "reader"
 principals = ["sandbox:*"]
@@ -205,36 +207,36 @@ func TestCompileRefusesWhatWouldOtherwiseFailSilently(t *testing.T) {
 	cases := map[string]string{
 		"unknown verb": `
 [roles.r]
-grants = ["sned:*"]`,
+permissions = ["sned:*"]`,
 		"unknown selector": `
 [roles.r]
-grants = ["read:owner:me"]`,
+permissions = ["read:owner:me"]`,
 		"unknown role in binding": `
 [roles.r]
-grants = ["read:*"]
+permissions = ["read:*"]
 [[bind]]
 role = "rr"
 principals = ["user:1"]`,
 		"binding to nobody": `
 [roles.r]
-grants = ["read:*"]
+permissions = ["read:*"]
 [[bind]]
 role = "r"`,
-		"role that grants nothing": `
+		"role that permits nothing": `
 [roles.r]
-grants = []`,
+permissions = []`,
 		"grant without selectors": `
 [roles.r]
-grants = ["read"]`,
+permissions = ["read"]`,
 		"the retired table form": `
 [roles.r]
-grants = [{ verbs = ["read"], on = ["*"] }]`,
+permissions = [{ verbs = ["read"], on = ["*"] }]`,
 		"misspelled key": `
 [roles.r]
 grant = ["read:*"]`,
 		"malformed principal": `
 [roles.r]
-grants = ["read:*"]
+permissions = ["read:*"]
 [[bind]]
 role = "r"
 principals = ["1000"]`,
@@ -252,12 +254,12 @@ func TestASchemaWithoutSelectorsAcceptsOnlyTheWildcard(t *testing.T) {
 	schema := jkauthz.Schema[struct{}]{Verbs: []string{"use"}}
 	if _, err := jkauthz.Compile([]byte(`
 [roles.r]
-grants = ["use:*"]`), schema); err != nil {
+permissions = ["use:*"]`), schema); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := jkauthz.Compile([]byte(`
 [roles.r]
-grants = ["use:thing:1"]`), schema); err == nil {
+permissions = ["use:thing:1"]`), schema); err == nil {
 		t.Fatal("compiled a selector nothing can match")
 	}
 }
@@ -356,10 +358,59 @@ func TestReadersNeverSeeAHalfLoadedPolicy(t *testing.T) {
 func TestTheRetiredTableFormIsRefusedWithItsStringSpelling(t *testing.T) {
 	_, err := jkauthz.Compile([]byte(`
 [roles.sender]
-grants = [{ verbs = ["read", "send"], on = ["owner:self", "role:@herald"] }]
+permissions = [{ verbs = ["read", "send"], on = ["owner:self", "role:@herald"] }]
 `), figaroSchema)
-	want := `[roles.sender] grants = ["read:owner:self", "read:role:@herald", "send:owner:self", "send:role:@herald"]`
+	want := `[roles.sender] permissions = ["read:owner:self", "read:role:@herald", "send:owner:self", "send:role:@herald"]`
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Fatalf("want the string form in the error, got %v", err)
+	}
+}
+
+func TestTheRetiredTableFormUnderTheOldNameIsRefusedWithTheNewSpelling(t *testing.T) {
+	_, err := jkauthz.Compile([]byte(`
+[roles.sender]
+grants = [{ verbs = ["read"], on = ["owner:self"] }]
+`), figaroSchema)
+	if err == nil || !strings.Contains(err.Error(), `[roles.sender] permissions = ["read:owner:self"]`) {
+		t.Fatalf("want the permissions spelling in the error, got %v", err)
+	}
+}
+
+func TestGrantsIsTheOldNameForPermissionsAndDecidesTheSame(t *testing.T) {
+	const body = `
+[roles.%s]
+%s = ["read:*", "send:owner:self"]
+
+[[bind]]
+role = "r"
+principals = ["user:1000"]
+`
+	newer, err := jkauthz.Compile([]byte(fmt.Sprintf(body, "r", "permissions")), figaroSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	older, err := jkauthz.Compile([]byte(fmt.Sprintf(body, "r", "grants")), figaroSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := newer.RetiredNames(); len(got) != 0 {
+		t.Fatalf("permissions reported as retired: %v", got)
+	}
+	if got := older.RetiredNames(); !slices.Equal(got, []string{"[roles.r] grants"}) {
+		t.Fatalf("retired names %v", got)
+	}
+	if !reflect.DeepEqual(newer.Roles(), older.Roles()) {
+		t.Fatalf("roles differ: %v vs %v", newer.Roles(), older.Roles())
+	}
+}
+
+func TestARoleNamingBothPermissionsAndGrantsIsRefused(t *testing.T) {
+	_, err := jkauthz.Compile([]byte(`
+[roles.r]
+permissions = ["read:*"]
+grants = ["read:*"]
+`), figaroSchema)
+	if err == nil || !strings.Contains(err.Error(), "both permissions and grants") {
+		t.Fatalf("want the conflict named, got %v", err)
 	}
 }

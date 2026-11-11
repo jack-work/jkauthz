@@ -19,10 +19,10 @@ a display name). `Policy.Allow` never sees them.
 
 ```toml
 [roles.owner]
-grants = ["*:*"]
+permissions = ["*:*"]
 
 [roles.sender]
-grants = [
+permissions = [
   "read:owner:self", "listen:owner:self", "send:owner:self",
   "read:role:@herald", "listen:role:@herald", "send:role:@herald",
 ]
@@ -38,7 +38,7 @@ principals = ["sandbox:*"]
 ```
 
 A grant is `verb:object`. The verb ends at the first colon, so the object
-keeps its own colons; either side may be `*`. A role's grants are held in
+keeps its own colons; either side may be `*`. A role's permissions are held in
 canonical form: duplicates and grants another one covers are dropped (`*:X`
 covers `read:X`, `read:*` covers `read:X`), then sorted by the schema's verb
 order and by object. `Grants.String` prints that form and `ParseGrants`
@@ -49,8 +49,8 @@ implementation that validates and matches every selector except `*` against
 its own resource type. Allow-only: nothing is permitted unless a bound role
 grants the verb on a selector that matches.
 
-Compile refuses unknown verbs, selectors and keys, roles that grant nothing,
-and bindings to nobody. A `Store` swaps policies atomically; a failed load
+Compile refuses unknown verbs, selectors and keys, roles that permit nothing,
+and bindings to nobody. `grants` is the old name for `permissions`: it still loads, `RetiredNames` lists each role that uses it, and a role naming both is refused. A `Store` swaps policies atomically; a failed load
 keeps the policy that was serving, and a store with nothing loaded denies.
 
 ## Bearer tokens
