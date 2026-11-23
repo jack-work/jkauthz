@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"mime"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -42,15 +43,36 @@ func (m ByClient) Resolve(ctx context.Context, token string, c Claims) (jkauthz.
 	return r.Resolve(ctx, token, c)
 }
 
+// SubjectStore persists the subjects Userinfo last resolved, keyed by token
+// subject, so a restart while the endpoint is unreachable can still serve them
+// within StaleFor.
+type SubjectStore interface {
+	Load() ([]byte, bool)
+	Save([]byte) error
+}
+
 type Userinfo struct {
 	URL     string
 	IDClaim string
 	TTL     time.Duration
-	HTTP    *http.Client
-	Now     func() time.Time
+	// StaleFor lets the last subject resolved for a token subject keep serving
+	// for this long past TTL (and never past the token's expiry) while the
+	// userinfo endpoint is unreachable. A refusal from the endpoint (401, 403)
+	// never serves stale. Zero keeps the strict behaviour: a failed lookup is a
+	// failed authentication.
+	StaleFor time.Duration
+	// Store, when set with StaleFor, keeps the last resolved subjects across
+	// restarts.
+	Store SubjectStore
+	HTTP  *http.Client
+	Now   func() time.Time
 
-	mu    sync.Mutex
-	cache map[[32]byte]cached
+	mu      sync.Mutex
+	cache   map[[32]byte]cached
+	last    map[string]lastGood
+	loaded  bool
+	savedAt time.Time
+	dirty   bool
 }
 
 type cached struct {
@@ -58,7 +80,16 @@ type cached struct {
 	until   time.Time
 }
 
-const userinfoCacheCap = 1024
+type lastGood struct {
+	Subject jkauthz.Subject `json:"subject"`
+	At      time.Time       `json:"at"`
+	retry   time.Time
+}
+
+const (
+	userinfoCacheCap = 1024
+	saveEvery        = time.Minute
+)
 
 func (u *Userinfo) Resolve(ctx context.Context, token string, c Claims) (jkauthz.Subject, error) {
 	now := u.now()
@@ -68,10 +99,31 @@ func (u *Userinfo) Resolve(ctx context.Context, token string, c Claims) (jkauthz
 		u.mu.Unlock()
 		return e.subject, nil
 	}
+	if s, ok := u.staleHeld(c, now, true); ok {
+		u.mu.Unlock()
+		return s, nil
+	}
 	u.mu.Unlock()
 
 	s, err := u.fetch(ctx, token, c)
 	if err != nil {
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		if errors.Is(err, ErrUnavailable) {
+			if s, ok := u.staleHeld(c, now, false); ok {
+				l := u.last[c.Subject]
+				l.retry = now.Add(u.ttl())
+				u.last[c.Subject] = l
+				return s, nil
+			}
+		}
+		if errors.Is(err, ErrInvalid) && c.Subject != "" {
+			if _, ok := u.last[c.Subject]; ok {
+				delete(u.last, c.Subject)
+				u.dirty = true
+				u.save(now)
+			}
+		}
 		return jkauthz.Subject{}, err
 	}
 	until := now.Add(u.ttl())
@@ -94,7 +146,76 @@ func (u *Userinfo) Resolve(ctx context.Context, token string, c Claims) (jkauthz
 		}
 	}
 	u.cache[key] = cached{subject: s, until: until}
+	u.remember(c, s, now)
 	return s, nil
+}
+
+func (u *Userinfo) staleHeld(c Claims, now time.Time, quiet bool) (jkauthz.Subject, bool) {
+	if u.StaleFor <= 0 || c.Subject == "" || !now.Before(c.Expiry) {
+		return jkauthz.Subject{}, false
+	}
+	u.restore()
+	l, ok := u.last[c.Subject]
+	if !ok || !now.Before(l.At.Add(u.ttl()+u.StaleFor)) {
+		return jkauthz.Subject{}, false
+	}
+	if quiet && !now.Before(l.retry) {
+		return jkauthz.Subject{}, false
+	}
+	return l.Subject, true
+}
+
+func (u *Userinfo) restore() {
+	if u.loaded {
+		return
+	}
+	u.loaded = true
+	if u.last == nil {
+		u.last = map[string]lastGood{}
+	}
+	if u.Store == nil {
+		return
+	}
+	raw, ok := u.Store.Load()
+	if !ok {
+		return
+	}
+	var held map[string]lastGood
+	if json.Unmarshal(raw, &held) == nil {
+		for sub, l := range held {
+			u.last[sub] = l
+		}
+	}
+}
+
+func (u *Userinfo) remember(c Claims, s jkauthz.Subject, now time.Time) {
+	if u.StaleFor <= 0 || c.Subject == "" {
+		return
+	}
+	u.restore()
+	prev, had := u.last[c.Subject]
+	u.last[c.Subject] = lastGood{Subject: s, At: now}
+	if !had || !sameSubject(prev.Subject, s) {
+		u.dirty = true
+	}
+	u.save(now)
+}
+
+func (u *Userinfo) save(now time.Time) {
+	if u.Store == nil || (!u.dirty && now.Sub(u.savedAt) < saveEvery) {
+		return
+	}
+	raw, err := json.Marshal(u.last)
+	if err != nil {
+		return
+	}
+	if u.Store.Save(raw) == nil {
+		u.savedAt, u.dirty = now, false
+	}
+}
+
+func sameSubject(a, b jkauthz.Subject) bool {
+	return a.Principal == b.Principal && slices.Equal(a.Groups, b.Groups)
 }
 
 func (u *Userinfo) fetch(ctx context.Context, token string, c Claims) (jkauthz.Subject, error) {
@@ -110,9 +231,12 @@ func (u *Userinfo) fetch(ctx context.Context, token string, c Claims) (jkauthz.S
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return jkauthz.Subject{}, fmt.Errorf("bearer: userinfo: %w", err)
+		return jkauthz.Subject{}, fmt.Errorf("%w: userinfo: %v", ErrUnavailable, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
+		return jkauthz.Subject{}, fmt.Errorf("%w: userinfo %s", ErrUnavailable, resp.Status)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return jkauthz.Subject{}, fmt.Errorf("%w: userinfo %s", ErrInvalid, resp.Status)
 	}

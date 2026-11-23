@@ -37,6 +37,7 @@ type issuerFixture struct {
 	mu    sync.Mutex
 	keys  map[string]*rsa.PrivateKey
 	hits  atomic.Int32
+	down  atomic.Bool
 	srv   *httptest.Server
 }
 
@@ -45,6 +46,10 @@ func newIssuer(t testing.TB) *issuerFixture {
 	f.rotate("k1")
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.hits.Add(1)
+		if f.down.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		var set jose.JSONWebKeySet

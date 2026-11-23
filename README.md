@@ -57,7 +57,13 @@ keeps the policy that was serving, and a store with nothing loaded denies.
 
 `bearer.Verifier` checks signature (JWKS, refetched on an unknown kid at most
 once a minute and at least hourly), issuer, expiry and, when configured,
-audience and `typ`.
+audience and `typ`. With `Config.MaxStale` set, a failed refresh keeps the last
+good key set in use for that long past the hourly refresh, retrying at most
+once a minute, and `OnStale` fires once per outage. With `Config.Store` set,
+the key set is saved after each fetch and loaded at construction, so a restart
+while the issuer is down still verifies. Both default off: a failed refresh
+fails verification. Failures to reach the issuer wrap `ErrUnavailable`; the
+issuer refusing a token wraps `ErrInvalid`.
 
 Token claims are never authorized on. Authelia 4.39 access tokens carry no
 `aud` and no groups, and a refresh is not re-authorized. So a verified token
@@ -69,4 +75,8 @@ only yields `client_id` and `sub`, and a `Resolver` turns those into a subject:
   service clients).
 - `bearer.Userinfo` asks the issuer's userinfo endpoint for the user and
   groups, cached per token for 30s and never past the token's expiry. A
-  failed lookup is a failed authentication.
+  failed lookup is a failed authentication, unless `StaleFor` is set: then an
+  unreachable endpoint (network, 5xx, 429) keeps serving the last subject for
+  that long past the TTL and never past the token's expiry, asking again at
+  most once per TTL. `Userinfo.Store` keeps those subjects (by token subject, never
+  the token) across restarts. A 401 or 403 from the endpoint revokes at once.
