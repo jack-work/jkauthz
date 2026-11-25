@@ -223,3 +223,20 @@ func TestAUserinfoStartedDuringAnOutageServesTheSubjectsItResolvedBefore(t *test
 		t.Fatalf("a restart during an outage lost the resolved subject: %v %v", s, err)
 	}
 }
+
+func TestAPersistedFetchTimeInTheFutureDoesNotHoldBackTheNextRefresh(t *testing.T) {
+	f := newIssuer(t)
+	store := &memStore{}
+	f.verifier(func(c *bearer.Config) { c.Store = store }).Verify(context.Background(), f.sign(f.access("u", "c")))
+	raw, _, _ := store.Load()
+	store.Save(raw, f.clock.Now().Add(24*time.Hour))
+
+	v := f.verifier(func(c *bearer.Config) { c.Store = store })
+	f.rotate("k2")
+	f.clock.Add(2 * time.Minute)
+	x := f.access("u", "c")
+	x.kid = "k2"
+	if _, err := v.Verify(context.Background(), f.sign(x)); err != nil {
+		t.Fatalf("a fetch time from the future kept a rotated key unknown: %v", err)
+	}
+}

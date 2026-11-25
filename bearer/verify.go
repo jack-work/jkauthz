@@ -157,6 +157,9 @@ func (k *keySet) restore() {
 	if json.Unmarshal(raw, &set) != nil || len(set.Keys) == 0 {
 		return
 	}
+	if now := k.cfg.Now(); fetched.After(now) {
+		fetched = now
+	}
 	k.set, k.fetched = set, fetched
 }
 
